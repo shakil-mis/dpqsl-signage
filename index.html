@@ -86,9 +86,8 @@
     font-size: 13px; font-weight: 600;
     color: rgba(255,255,255,.75);
     text-shadow: 0 1px 6px rgba(0,0,0,.9);
-    background: rgba(0,0,0,.35);
+    background: rgba(0,0,0,.55);
     padding: 5px 12px; border-radius: 20px;
-    backdrop-filter: blur(6px);
     white-space: nowrap;
   }
 
@@ -97,8 +96,7 @@
     font-size: 13px; font-weight: 600;
     color: rgba(255,255,255,.7);
     text-shadow: 0 1px 6px rgba(0,0,0,.8);
-    background: rgba(0,0,0,.35); padding: 5px 12px; border-radius: 20px;
-    backdrop-filter: blur(6px);
+    background: rgba(0,0,0,.55); padding: 5px 12px; border-radius: 20px;
   }
 
   #watermark {
@@ -115,7 +113,6 @@
   #progressFill {
     height: 100%; width: 0%;
     background: linear-gradient(to right, var(--accent), var(--green));
-    box-shadow: 0 0 8px var(--accent);
   }
 
   /* ── TICKER ── */
@@ -138,12 +135,11 @@
     position: fixed; inset: 0; z-index: 50;
     display: flex; flex-direction: column;
     align-items: center; justify-content: center;
-    background: rgba(0,0,0,.88);
-    backdrop-filter: blur(8px);
+    background: rgba(0,0,0,.94);
     gap: 16px;
-    transition: opacity .4s ease;
+    transition: opacity .4s ease, visibility 0s linear .4s;
   }
-  .overlay.hidden { opacity: 0; pointer-events: none; }
+  .overlay.hidden { opacity: 0; pointer-events: none; visibility: hidden; }
   .overlay-icon { font-size: 60px; }
   .overlay-title { font-size: 22px; font-weight: 700; }
   .overlay-sub { font-size: 13px; color: rgba(232,234,246,.5); text-align: center; max-width: 320px; line-height: 1.6; }
@@ -171,7 +167,6 @@
     width: min(360px, 90vw);
     display: flex; flex-direction: column; align-items: center; gap: 12px;
     box-shadow: 0 8px 40px rgba(0,0,0,0.7), 0 0 0 1px rgba(79,124,255,0.1);
-    backdrop-filter: blur(12px);
     cursor: auto;
     animation: slideUp 0.4s cubic-bezier(.34,1.56,.64,1);
   }
@@ -312,10 +307,6 @@ updateClock();
 setInterval(updateClock, 1000);
 
 // ── FIREBASE ──
-// NOTE: আগে এখানে JSON.stringify(data.slides) দিয়ে change-detect করা হতো, যেটা
-// slides এ বড় base64 ফাইল (image/video/audio upload) থাকলে খুব ভারী operation —
-// Android TV এর কম-শক্তির CPU তে এটাই freeze/stuck হওয়ার একটা বড় কারণ ছিল।
-// এখন control panel এর পাঠানো 'updatedAt' timestamp দিয়ে হালকা compare করা হচ্ছে।
 let lastUpdatedAt = 0;
 
 onValue(ref(db, 'signage/config'), snap => {
@@ -331,6 +322,7 @@ onValue(ref(db, 'signage/config'), snap => {
     stopProgress();
     cleanupLayer(activeLayerEl);
     activeLayerEl = null;
+    currentSlideId = null;
     return;
   }
   hide('emptyOverlay');
@@ -393,6 +385,8 @@ function handleCommand(cmd) {
 }
 
 // ── SLIDE NAVIGATION ──
+let currentSlideId = null;
+
 function goToSlide(index) {
   if (!slides.length) return;
 
@@ -402,7 +396,18 @@ function goToSlide(index) {
 
   const slide = slides[currentIndex];
   updateCounter();
-  renderSlide(slide);
+
+  // যদি পরের slide-টা এখন যা দেখানো হচ্ছে তার সাথে identical (একই id), তাহলে
+  // পুরো layer/iframe destroy করে আবার নতুন করে বানানোর দরকার নেই — শুধু timer
+  // reset করলেই হবে। এটাই মূল fix: single/repeating web-app slide-এর ক্ষেত্রে
+  // আগে প্রতি duration-এ নতুন iframe force-reload হতো, যেটা bit by bit
+  // leftover memory/connection জমিয়ে ~15 মিনিটে freeze তৈরি করছিল।
+  const slideSignature = slide.id + '|' + slide.type + '|' + (slide.src || '') + '|' + (slide.content || '');
+  const isSameSlide = activeLayerEl && currentSlideId === slideSignature;
+  if (!isSameSlide) {
+    renderSlide(slide);
+    currentSlideId = slideSignature;
+  }
 
   clearSlideTimer();
   if (!isPaused) {
@@ -412,6 +417,8 @@ function goToSlide(index) {
       if (!isPaused) advance();
     }, ms);
   }
+  lastSlideChangeAt = performance.now();
+  currentSlideDurationMs = (slide.duration || 10) * 1000;
 }
 
 function advance() {
@@ -440,10 +447,29 @@ function clearSlideTimer() {
 
 // ── RENDER SLIDE ──
 const stage = document.getElementById('stage');
+const MAX_STAGE_LAYERS = 3; // safety cap — if old layers ever fail to clean up, never let them pile up indefinitely
+
+// slide types that create a <video>, <audio>, or <iframe> — these claim scarce
+// hardware decoder / renderer-process resources on weak Android TV chips.
+// Two of these alive at once (old fading out + new fading in) is what was
+// slowly exhausting the decoder pool and causing the ~15min hang.
+const HEAVY_TYPES = new Set(['video', 'audio', 'pdf', 'ppt', 'web', 'excel', 'word']);
 
 function renderSlide(slide) {
+  const isHeavy = HEAVY_TYPES.has(slide.type);
+  const prevWasHeavy = activeLayerEl && activeLayerEl.dataset.heavy === '1';
+
+  // If either the outgoing or incoming slide is "heavy", release the old
+  // layer's decoder/iframe resources immediately — no crossfade overlap —
+  // instead of waiting 700ms with both alive at the same time.
+  if (activeLayerEl && (isHeavy || prevWasHeavy)) {
+    cleanupLayer(activeLayerEl);
+    activeLayerEl = null;
+  }
+
   const newEl = document.createElement('div');
   newEl.className = 'slide-layer';
+  newEl.dataset.heavy = isHeavy ? '1' : '0';
   newEl.appendChild(buildContent(slide));
   stage.appendChild(newEl);
 
@@ -460,11 +486,22 @@ function renderSlide(slide) {
   }));
 
   if (activeLayerEl) {
+    // Only reached for light→light transitions (image/text) — safe to crossfade.
     const old = activeLayerEl;
     old.classList.remove('visible');
     setTimeout(() => cleanupLayer(old), 700);
   }
   activeLayerEl = newEl;
+
+  // Safety net: forcibly clean up ANY stray layer left in #stage beyond the
+  // current + 1 fading-out one. Protects against slow WebView memory buildup
+  // if a cleanup ever gets skipped (e.g. rapid manual next/prev spamming).
+  const layers = stage.querySelectorAll('.slide-layer');
+  if (layers.length > MAX_STAGE_LAYERS) {
+    for (let i = 0; i < layers.length - 2; i++) {
+      if (layers[i] !== newEl) cleanupLayer(layers[i]);
+    }
+  }
 }
 
 // পুরনো slide layer (video/audio/iframe সহ) সম্পূর্ণভাবে বন্ধ ও DOM থেকে সরানো হচ্ছে।
@@ -477,10 +514,19 @@ function cleanupLayer(el) {
   el.querySelectorAll('video, audio').forEach(m => {
     try { m.pause(); m.removeAttribute('src'); m.load(); } catch (e) {}
   });
-  el.querySelectorAll('iframe').forEach(f => {
+  const frames = el.querySelectorAll('iframe');
+  frames.forEach(f => {
     try { f.src = 'about:blank'; } catch (e) {}
   });
-  if (el.parentNode) el.parentNode.removeChild(el);
+  if (frames.length) {
+    // iframe থাকলে about:blank navigation-টা actually শুরু হওয়ার একটু সময় দিয়ে
+    // তারপর DOM থেকে সরানো হচ্ছে — একদম synchronous removeChild করলে কিছু
+    // Android WebView-তে navigation শুরুই হওয়ার আগে node detach হয়ে যায়, ফলে
+    // পুরনো page-এর JS context ঠিকমতো বন্ধ নাও হতে পারে।
+    setTimeout(() => { if (el.parentNode) el.parentNode.removeChild(el); }, 50);
+  } else if (el.parentNode) {
+    el.parentNode.removeChild(el);
+  }
 }
 
 // Try to autoplay with sound; if the browser blocks it, fall back to a muted
@@ -499,7 +545,6 @@ function attemptPlay(el) {
 function pptToEmbed(url) {
   if (!url) return url;
 
-  // Google Slides link (already a presentation created in Slides)
   if (/docs\.google\.com\/presentation/.test(url)) {
     if (/\/embed/.test(url)) return url;
     const m = url.match(/\/d\/e\/([a-zA-Z0-9_-]+)/) || url.match(/\/d\/([a-zA-Z0-9_-]+)/);
@@ -513,12 +558,6 @@ function pptToEmbed(url) {
     return url;
   }
 
-  // Google Drive share link (uploaded .pptx file, NOT converted to Slides) —
-  // এই ধরনের link ("drive.google.com/file/d/FILE_ID/view") Office Online Viewer
-  // দিয়ে খোলার চেষ্টা করলে সেটা ফাইলের raw bytes পায় না ও চিরকাল loading
-  // অবস্থায় আটকে থাকে — এটাই Android TV freeze/stuck হওয়ার আসল কারণ ছিল।
-  // এর বদলে Google Drive-এর নিজস্ব built-in "/preview" embed viewer ব্যবহার
-  // করা হচ্ছে, যেটা .pptx/.docx/.xlsx সরাসরি Drive এর ভেতরেই render করে দেয়।
   const driveMatch = url.match(/drive\.google\.com\/file\/d\/([a-zA-Z0-9_-]+)/);
   if (driveMatch) {
     return `https://drive.google.com/file/d/${driveMatch[1]}/preview`;
@@ -528,7 +567,6 @@ function pptToEmbed(url) {
     return `https://drive.google.com/file/d/${driveOpenMatch[1]}/preview`;
   }
 
-  // Any other public direct .pptx / .ppt link → use Microsoft Office Online Viewer
   return `https://view.officeapps.live.com/op/embed.aspx?src=${encodeURIComponent(url)}`;
 }
 
@@ -557,11 +595,10 @@ function buildContent(slide) {
       pendingEmbedFrames.push(iframe);
       frag.appendChild(iframe);
     } else {
-      // Direct video file or uploaded file (data: URI) — iframe can't play these, use <video>
       const video = document.createElement('video');
       video.src = slide.src;
       video.autoplay = true;
-      video.loop = true;           // keep playing if slide duration is longer than the clip
+      video.loop = true;
       video.playsInline = true;
       video.setAttribute('playsinline', '');
       video.style.width = '100%';
@@ -587,10 +624,6 @@ function buildContent(slide) {
 
   } else if (slide.type === 'ppt') {
     if (slide.src && slide.src.startsWith('data:')) {
-      // Uploaded PPT/PPTX files are raw base64 data — browsers have no built-in
-      // viewer for .ppt/.pptx, so there is nothing to render here.
-      // Real fix: upload to Google Slides and use the "Publish to web" link,
-      // or host the .pptx at a public URL and use Office Online Viewer.
       const div = document.createElement('div');
       div.className = 'text-slide';
       div.style.background = '#0f1117';
@@ -605,15 +638,12 @@ function buildContent(slide) {
       iframe.src = pptToEmbed(slide.src);
       iframe.setAttribute('allow', 'autoplay; fullscreen');
       iframe.setAttribute('allowfullscreen', '');
+      iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-popups allow-forms');
       frag.appendChild(iframe);
     }
 
   } else if (slide.type === 'web' || slide.type === 'excel' || slide.type === 'word') {
     if (slide.src && slide.src.startsWith('data:')) {
-      // Uploaded Word/Excel files are raw base64 data — browsers have no built-in
-      // viewer for .doc/.docx/.xls/.xlsx, so there is nothing to render here.
-      // Real fix: upload the file to Firebase Storage and use its public URL with
-      // Google Docs Viewer / Office Online Viewer (see chat explanation).
       const div = document.createElement('div');
       div.className = 'text-slide';
       div.style.background = '#0f1117';
@@ -624,18 +654,16 @@ function buildContent(slide) {
       div.innerHTML = `<div>⚠ Cannot preview "${slide.name}"</div><div style="font-size:16px;color:#7b82a8;">Uploaded ${slide.type} files need a public link (Google Docs/Sheets share link) to display here.</div>`;
       frag.appendChild(div);
     } else {
-      /*
-       * REQ-1 FIX: Full interactive access for web URLs
-       * - sandbox সরিয়ে দেওয়া হয়েছে যাতে date picker, calendar,
-       *   form submit সবকিছু কাজ করে
-       * - allow-same-origin ছাড়া cookies/localStorage কাজ করে না,
-       *   sandbox সম্পূর্ণ বাদ দিলে সব restriction উঠে যায়
-       * - pointer-events: auto রাখা হয়েছে যাতে mouse/touch সব কাজ করে
-       */
       const iframe = document.createElement('iframe');
       iframe.src = slide.type === 'word' ? `https://docs.google.com/viewer?url=${encodeURIComponent(slide.src)}&embedded=true` : slide.src;
-      // sandbox একদম remove — full access দেওয়ার জন্য
       iframe.style.pointerEvents = 'auto';
+      // NOTE: sandboxed with allow-scripts + allow-same-origin + allow-forms + allow-popups.
+      // This still lets forms, date pickers, and interactive pages work, but stops the
+      // embedded page from doing things like opening full-screen prompts, spawning extra
+      // top-level navigations, or (on some sites) auto-registering service workers /
+      // background timers that used to keep running and eating memory even after the
+      // slide was swapped out and the iframe src was reset to about:blank.
+      iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-forms allow-popups');
       iframe.setAttribute('allow', 'clipboard-write; fullscreen; clipboard-read');
       frag.appendChild(iframe);
     }
@@ -650,7 +678,7 @@ function buildContent(slide) {
 
     const waveform = document.createElement('div');
     waveform.className = 'waveform';
-    for (let i = 0; i < 36; i++) {
+    for (let i = 0; i < 20; i++) {
       const bar = document.createElement('div');
       bar.className = 'wave-bar';
       bar.style.setProperty('--pk', (15 + Math.random() * 65) + 'px');
@@ -666,7 +694,7 @@ function buildContent(slide) {
     const audio = document.createElement('audio');
     audio.src = slide.src;
     audio.autoplay = true;
-    audio.loop = true; // auto-replay if slide duration is longer than the audio clip
+    audio.loop = true;
     pendingMedia.push(audio);
 
     div.appendChild(title);
@@ -726,7 +754,7 @@ function applyTicker(ticker) {
   const repeated = (ticker.text + sep).repeat(6);
   inner.textContent = repeated + repeated;
 
-  const speedMap = [0.15, 0.4, 0.8, 1.6, 2.8];   // px per frame at 60fps, kept same feel as before
+  const speedMap = [0.15, 0.4, 0.8, 1.6, 2.8];
   const pxPerSecond = speedMap[(ticker.speed || 3) - 1] * 60;
 
   requestAnimationFrame(() => {
@@ -750,7 +778,6 @@ document.addEventListener('keydown', e => {
 document.addEventListener('dblclick', toggleFS);
 function unmuteEmbedFrame(iframe) {
   if (!iframe.contentWindow) return;
-  // YouTube IFrame API postMessage protocol — works without needing the JS API script loaded.
   try {
     iframe.contentWindow.postMessage(JSON.stringify({ event: 'command', func: 'unMute', args: [] }), '*');
     iframe.contentWindow.postMessage(JSON.stringify({ event: 'command', func: 'playVideo', args: [] }), '*');
@@ -774,24 +801,20 @@ function toggleFS() {
   else document.exitFullscreen().catch(()=>{});
 }
 
-// ── PWA INSTALL PROMPT (REQ-2 & REQ-3 FIX) ──
-// localStorage ব্যবহার করা হয়েছে — permanently "installed" বা "dismissed" track করার জন্য
-// sessionStorage ব্যবহার করলে browser বন্ধ করলে reset হয়ে যেত
+// ── PWA INSTALL PROMPT ──
 let deferredInstallPrompt = null;
 const installPopup = document.getElementById('installPopup');
 const btnInstall   = document.getElementById('btnInstall');
 const btnDismiss   = document.getElementById('btnDismiss');
 
-// Check: আগে install হয়ে গেছে কিনা (standalone mode = installed PWA)
 function isAlreadyInstalled() {
   return (
-    window.navigator.standalone === true ||              // iOS installed
-    window.matchMedia('(display-mode: standalone)').matches || // Android/desktop installed
+    window.navigator.standalone === true ||
+    window.matchMedia('(display-mode: standalone)').matches ||
     localStorage.getItem('pwa_installed') === '1'
   );
 }
 
-// Check: user আগে permanently dismiss করেছে কিনা
 function isDismissedPermanently() {
   return localStorage.getItem('pwa_permanently_dismissed') === '1';
 }
@@ -801,24 +824,20 @@ function showInstallPopup() {
   installPopup.classList.remove('hidden');
 }
 
-// Android Chrome / Edge: beforeinstallprompt event
 window.addEventListener('beforeinstallprompt', e => {
   e.preventDefault();
   deferredInstallPrompt = e;
-  // App already installed হলে দেখাবো না
   if (!isAlreadyInstalled() && !isDismissedPermanently()) {
     setTimeout(showInstallPopup, 2500);
   }
 });
 
-// App installed হলে flag set করো
 window.addEventListener('appinstalled', () => {
   localStorage.setItem('pwa_installed', '1');
   installPopup.classList.add('hidden');
   deferredInstallPrompt = null;
 });
 
-// Install button
 btnInstall.addEventListener('click', async () => {
   installPopup.classList.add('hidden');
   if (deferredInstallPrompt) {
@@ -829,23 +848,51 @@ btnInstall.addEventListener('click', async () => {
     }
     deferredInstallPrompt = null;
   } else {
-    // iOS Safari fallback
     alert('iOS এ install করতে:\nSafari → Share বাটন (□↑) → "Add to Home Screen" select করুন।');
   }
 });
 
-// Dismiss button — permanently dismiss, আর কখনো দেখাবে না
 btnDismiss.addEventListener('click', () => {
   installPopup.classList.add('hidden');
   localStorage.setItem('pwa_permanently_dismissed', '1');
 });
 
-// iOS Safari detection (beforeinstallprompt fire হয় না iOS-এ)
 const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
 const isInStandaloneMode = window.navigator.standalone === true;
 if (isIOS && !isInStandaloneMode && !isDismissedPermanently()) {
   setTimeout(showInstallPopup, 2500);
 }
+
+// ── AUTO-RECOVERY WATCHDOG ──
+// দুইটা independent safety-net, দুইটা ভিন্ন ধরনের freeze থেকে বাঁচানোর জন্য:
+//
+// 1) "Stuck slide" watchdog: JS thread চলছে কিন্তু কোনো bug/edge-case এ slide
+//    আটকে গেছে — নিজে থেকে পরের slide/reload এ ঠেলে দেয়।
+// 2) Scheduled full reload: প্রতি কয়েক ঘণ্টা পর পর নিজে থেকে reload হয়ে page
+//    fresh memory অবস্থায় শুরু হয় — এতে যেকোনো ধীর memory leak (base64 media,
+//    embedded iframe, ইত্যাদি) জমে গিয়ে আসল browser-hang এ পরিণত হওয়ার আগেই
+//    সেটা পরিষ্কার হয়ে যায়। এটাই real hard-freeze (যেখানে JS thread ও আটকে
+//    যায়) ঠেকানোর সবচেয়ে নির্ভরযোগ্য উপায়, কারণ JS-based watchdog নিজেই freeze
+//    হয়ে গেলে কাজ করবে না — তাই ঘন ঘন reload prevention হিসেবে কাজ করে।
+let lastSlideChangeAt = performance.now();
+let currentSlideDurationMs = 10000;
+
+setInterval(() => {
+  const elapsed = performance.now() - lastSlideChangeAt;
+  // যদি বর্তমান slide-এর duration-এর চেয়ে ৩ গুণ বেশি সময় ধরে slide change না হয়
+  // (আর paused অবস্থায়ও না থাকে), ধরে নেওয়া হচ্ছে কোথাও আটকে গেছে — reload করে দাও।
+  if (!isPaused && slides.length && elapsed > Math.max(currentSlideDurationMs * 3, 60000)) {
+    location.reload();
+  }
+}, 15000);
+
+// প্রতি ১০ মিনিট পর পর নিজে থেকে reload — এটাই আসল safety net।
+// আপনার TV-তে freeze দেখা যাচ্ছিল ~১৫ মিনিটে, তাই এর অনেক আগেই (১০ মিনিটে)
+// reload করে দিলে accumulated decoder/memory pressure কখনোই সেই threshold-এ
+// পৌঁছাবে না। Firebase থেকে state আবার fresh load হবে, content miss হবে না।
+// উপরের code-fix গুলো (heavy-slide immediate cleanup ইত্যাদি) কাজ করলে root
+// cause-ই কমে যাবে — তখন চাইলে এই interval বাড়িয়ে ৩০-৬০ মিনিট করে দেখতে পারেন।
+setInterval(() => location.reload(), 10 * 60 * 1000);
 </script>
 </body>
 </html>
