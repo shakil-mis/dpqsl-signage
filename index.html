@@ -11,6 +11,9 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black">
 <meta name="apple-mobile-web-app-title" content="DPQSL Signage">
 <link rel="apple-touch-icon" href="logo-1.png">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -420,6 +423,29 @@ function goToSlide(index) {
   lastSlideChangeAt = performance.now();
   currentSlideDurationMs = (slide.duration || 10) * 1000;
 }
+
+// ── EMBEDDED WEB-APP REFRESH WATCHDOG ──
+// আমাদের নিজের slide-swap logic optimize করা থাকলেও, iframe-এর ভেতরে থাকা
+// interactive web app (যেমন Chart.js দিয়ে বানানো dashboard) নিজেই যদি data
+// re-poll করে আর পুরনো chart instance destroy না করে, তাহলে সেই leak পুরোপুরি
+// dashboard-এর নিজের ভেতরে হয় — এটা আমাদের signage shell-এর কোনো optimization
+// দিয়ে ঠেকানো যায় না, কারণ iframe-টা তো ইচ্ছাকৃতভাবেই একটানা চালু রাখা হচ্ছে
+// (same-slide skip logic-এর কারণে)। তাই এখানে আলাদাভাবে, প্রতি ৫ মিনিটে
+// সক্রিয় 'web'/'excel'/'word' iframe-টাকে নিজে থেকে reload করে দেওয়া হচ্ছে —
+// পুরো slide layer না ভেঙে, শুধু ওই iframe-টার ভেতরের app-state reset করার জন্য।
+const IFRAME_SELF_REFRESH_TYPES = new Set(['web', 'excel', 'word']);
+const IFRAME_SELF_REFRESH_MS = 5 * 60 * 1000; // 5 minutes
+
+setInterval(() => {
+  if (!activeLayerEl) return;
+  const slide = slides[currentIndex];
+  if (!slide || !IFRAME_SELF_REFRESH_TYPES.has(slide.type)) return;
+  const iframe = activeLayerEl.querySelector('iframe');
+  if (!iframe || !iframe.src || iframe.src === 'about:blank') return;
+  const src = iframe.src;
+  iframe.src = 'about:blank';
+  requestAnimationFrame(() => { iframe.src = src; });
+}, IFRAME_SELF_REFRESH_MS);
 
 function advance() {
   let next = currentIndex + 1;
@@ -877,12 +903,20 @@ if (isIOS && !isInStandaloneMode && !isDismissedPermanently()) {
 let lastSlideChangeAt = performance.now();
 let currentSlideDurationMs = 10000;
 
+// Plain location.reload() can, on some Android WebViews, still serve a
+// cached copy of index.html — especially right after the site's been moved
+// to a new GitHub username/repo. Forcing a fresh URL each time (cache-buster
+// query param) guarantees an actual network fetch of the latest deployed file.
+function hardReload() {
+  location.replace(location.pathname + '?_cb=' + Date.now());
+}
+
 setInterval(() => {
   const elapsed = performance.now() - lastSlideChangeAt;
   // যদি বর্তমান slide-এর duration-এর চেয়ে ৩ গুণ বেশি সময় ধরে slide change না হয়
   // (আর paused অবস্থায়ও না থাকে), ধরে নেওয়া হচ্ছে কোথাও আটকে গেছে — reload করে দাও।
   if (!isPaused && slides.length && elapsed > Math.max(currentSlideDurationMs * 3, 60000)) {
-    location.reload();
+    hardReload();
   }
 }, 15000);
 
@@ -892,7 +926,7 @@ setInterval(() => {
 // পৌঁছাবে না। Firebase থেকে state আবার fresh load হবে, content miss হবে না।
 // উপরের code-fix গুলো (heavy-slide immediate cleanup ইত্যাদি) কাজ করলে root
 // cause-ই কমে যাবে — তখন চাইলে এই interval বাড়িয়ে ৩০-৬০ মিনিট করে দেখতে পারেন।
-setInterval(() => location.reload(), 10 * 60 * 1000);
+setInterval(hardReload, 10 * 60 * 1000);
 </script>
 </body>
 </html>
